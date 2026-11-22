@@ -155,23 +155,28 @@ public sealed class AntigravityAccountService
             if (_accounts is null || _accounts.Count == 0) return;
 
             var current = GetCurrentOrBestAccount();
+
+            // 如果池中只有 1 个账号，不执行长达数分钟的全局锁定，避免因瞬时并发或突发限流导致整个服务自锁瘫痪
+            if (_accounts.Count <= 1)
+            {
+                _log.LogWarning("Single account in pool; skipping global account cooldown for {Email} ({Reason})", current.Email, reason);
+                return;
+            }
+
             current.CooldownUntil = DateTimeOffset.UtcNow + cooldown;
             _log.LogWarning("Account {Email} marked on cooldown for {Secs}s due to quota exhaustion ({Reason})",
                 current.Email, cooldown.TotalSeconds, reason);
 
-            if (_accounts.Count > 1)
+            var now = DateTimeOffset.UtcNow;
+            for (var i = 1; i <= _accounts.Count; i++)
             {
-                var now = DateTimeOffset.UtcNow;
-                for (var i = 1; i <= _accounts.Count; i++)
+                var nextIdx = (_activeAccountIndex + i) % _accounts.Count;
+                if (!_accounts[nextIdx].IsInCooldown(now))
                 {
-                    var nextIdx = (_activeAccountIndex + i) % _accounts.Count;
-                    if (!_accounts[nextIdx].IsInCooldown(now))
-                    {
-                        _activeAccountIndex = nextIdx;
-                        _log.LogInformation("Rotated active Antigravity account to {Email} ({Index}/{Total})",
-                            _accounts[nextIdx].Email, nextIdx + 1, _accounts.Count);
-                        return;
-                    }
+                    _activeAccountIndex = nextIdx;
+                    _log.LogInformation("Rotated active Antigravity account to {Email} ({Index}/{Total})",
+                        _accounts[nextIdx].Email, nextIdx + 1, _accounts.Count);
+                    return;
                 }
             }
         }

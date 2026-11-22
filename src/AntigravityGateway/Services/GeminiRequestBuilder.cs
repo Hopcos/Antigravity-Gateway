@@ -20,7 +20,7 @@ public static class GeminiRequestBuilder
             .ToList();
         if (systemParts.Count > 0)
         {
-            gemini.SystemInstruction = new GeminiContent { Parts = systemParts };
+            gemini.SystemInstruction = new GeminiContent { Parts = ConsolidateAdjacentTextParts(systemParts) };
         }
 
         foreach (var msg in req.Messages)
@@ -111,6 +111,16 @@ public static class GeminiRequestBuilder
                 merged.Add(c);
             }
         }
+
+        // 规范化：合并每个 Content 内部连续的相邻纯文本 Parts，避免上游解析器拒绝或速率限流
+        foreach (var c in merged)
+        {
+            if (c.Parts.Count > 1)
+            {
+                c.Parts = ConsolidateAdjacentTextParts(c.Parts);
+            }
+        }
+
         gemini.Contents = merged;
 
         if (gemini.Contents.Count == 0 && gemini.SystemInstruction is null)
@@ -217,6 +227,42 @@ public static class GeminiRequestBuilder
             _ => payload.ToString() ?? "(empty)"
         };
         return $"[function result for {fr.Name}]: {payloadText}";
+    }
+
+    private static List<GeminiPart> ConsolidateAdjacentTextParts(List<GeminiPart> parts)
+    {
+        var result = new List<GeminiPart>(parts.Count);
+        GeminiPart? currentText = null;
+
+        foreach (var p in parts)
+        {
+            if (p.Text is not null && p.FunctionCall is null && p.FunctionResponse is null)
+            {
+                if (currentText is null)
+                {
+                    currentText = new GeminiPart { Text = p.Text };
+                    result.Add(currentText);
+                }
+                else
+                {
+                    if (!string.IsNullOrEmpty(currentText.Text) && !string.IsNullOrEmpty(p.Text))
+                    {
+                        currentText.Text += "\n\n" + p.Text;
+                    }
+                    else
+                    {
+                        currentText.Text += p.Text;
+                    }
+                }
+            }
+            else
+            {
+                currentText = null;
+                result.Add(p);
+            }
+        }
+
+        return result;
     }
 
     private static bool ShouldMerge(GeminiContent a, GeminiContent b)

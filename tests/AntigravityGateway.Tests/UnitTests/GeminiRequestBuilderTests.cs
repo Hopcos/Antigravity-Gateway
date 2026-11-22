@@ -88,4 +88,29 @@ public class GeminiRequestBuilderTests
         Assert.NotNull(fnRespPart.FunctionResponse);
         Assert.Equal(toolName, fnRespPart.FunctionResponse.Name);
     }
+
+    [Fact]
+    public void Build_ConsecutiveUserMessages_ConsolidatesAdjacentTextParts()
+    {
+        var req = new ChatCompletionRequest
+        {
+            Model = "gemini-2.5-flash-lite",
+            Messages = new List<ChatMessage>
+            {
+                new() { Role = "user", Content = "你是什么模型？" },
+                new() { Role = "user", Content = "Current runtime context snapshot." },
+                new() { Role = "user", Content = "Current working directory: E:\\temp\\test-dsh" }
+            }
+        };
+
+        var gemini = GeminiRequestBuilder.Build(req);
+
+        // 验证 3 个连续 user 消息不仅合并为 1 个 Content 回合，其 3 个 text 节点还被压实合并为单一文本 Part
+        Assert.Single(gemini.Contents);
+        Assert.Equal("user", gemini.Contents[0].Role);
+        Assert.Single(gemini.Contents[0].Parts);
+        Assert.Contains("你是什么模型？", gemini.Contents[0].Parts[0].Text);
+        Assert.Contains("Current runtime context snapshot.", gemini.Contents[0].Parts[0].Text);
+        Assert.Contains("Current working directory: E:\\temp\\test-dsh", gemini.Contents[0].Parts[0].Text);
+    }
 }

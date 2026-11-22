@@ -261,6 +261,9 @@ public sealed class AntigravityProvider : IGeminiProvider
         {
             if (ct.IsCancellationRequested) break;
 
+            // 备选模型切换退避（600ms~1000ms），给上游速率限制器足够缓冲，避免毫秒级重试风暴
+            await Task.Delay(TimeSpan.FromMilliseconds(Random.Shared.Next(600, 1000)), ct);
+
             _log.LogInformation("Attempting failover to model '{FallbackModel}'...", fallbackModel);
             var fallbackYielded = false;
 
@@ -375,10 +378,10 @@ public sealed class AntigravityProvider : IGeminiProvider
 
                         resp.Dispose();
 
-                        // 若明确为硬性配额耗尽 (RESOURCE_EXHAUSTED)，通知账号服务并快速启动 Fallback 机制
+                        // 通知账号服务（多账号轮换场景下生效，单账号自动跳过）
                         if (IsQuotaOrCapacityExhausted(HttpStatusCode.TooManyRequests, errBody))
                         {
-                            _account.MarkAccountQuotaExhausted(TimeSpan.FromMinutes(5), "429 RESOURCE_EXHAUSTED");
+                            _account.MarkAccountQuotaExhausted(TimeSpan.FromMinutes(2), "429 RESOURCE_EXHAUSTED");
                             if (_enableFallback || attempt >= MaxAttempts)
                             {
                                 throw new UpstreamException(HttpStatusCode.TooManyRequests, errBody);
