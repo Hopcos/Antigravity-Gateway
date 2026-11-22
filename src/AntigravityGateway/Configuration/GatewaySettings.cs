@@ -11,6 +11,10 @@ public static class GatewaySettings
         // 顶层环境变量
         opts.ApiKey = Env("GEMINI_API_KEY") ?? Env("GATEWAY_API_KEY") ?? opts.ApiKey;
         opts.DefaultModel = Env("GEMINI_DEFAULT_MODEL") ?? opts.DefaultModel;
+        if (bool.TryParse(Env("ANTIGRAVITY_ENABLE_MODEL_FALLBACK"), out var emf))
+        {
+            opts.EnableModelFallback = emf;
+        }
 
         opts.Auth ??= new AuthOptions();
         opts.Auth.Source = Env("ANTIGRAVITY_AUTH_SOURCE") ?? opts.Auth.Source;
@@ -20,6 +24,16 @@ public static class GatewaySettings
         opts.Auth.ClientId = Env("ANTIGRAVITY_CLIENT_ID") ?? Env("GEMINI_CLIENT_ID") ?? opts.Auth.ClientId;
         opts.Auth.ClientSecret = Env("ANTIGRAVITY_CLIENT_SECRET") ?? Env("GEMINI_CLIENT_SECRET") ?? opts.Auth.ClientSecret;
         opts.Auth.RefreshToken = Env("ANTIGRAVITY_REFRESH_TOKEN") ?? Env("GEMINI_REFRESH_TOKEN") ?? opts.Auth.RefreshToken;
+
+        var tokensEnv = Env("ANTIGRAVITY_REFRESH_TOKENS");
+        if (!string.IsNullOrWhiteSpace(tokensEnv))
+        {
+            opts.Auth.RefreshTokens = tokensEnv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+        }
+        else if (!string.IsNullOrWhiteSpace(opts.Auth.RefreshToken) && opts.Auth.RefreshToken.Contains(','))
+        {
+            opts.Auth.RefreshTokens = opts.Auth.RefreshToken.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+        }
 
         // —— 默认配置 Antigravity Provider ——
         var antigravity = opts.Providers.GetValueOrDefault("Antigravity");
@@ -57,6 +71,7 @@ public static class GatewaySettings
         antigravity.UserAgent = Env("ANTIGRAVITY_USER_AGENT") ?? antigravity.UserAgent;
         if (int.TryParse(Env("ANTIGRAVITY_MAX_CONCURRENCY"), out var mc) && mc > 0) antigravity.MaxConcurrency = mc;
         if (int.TryParse(Env("ANTIGRAVITY_MIN_INTERVAL"), out var mi) && mi >= 0) antigravity.MinInterval = mi;
+        if (int.TryParse(Env("ANTIGRAVITY_MAX_ATTEMPTS"), out var ma) && ma > 0) antigravity.MaxAttempts = ma;
 
         var modelsEnv = Env("ANTIGRAVITY_MODELS");
         if (!string.IsNullOrWhiteSpace(modelsEnv))

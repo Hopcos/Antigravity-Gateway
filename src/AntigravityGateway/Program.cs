@@ -37,7 +37,8 @@ foreach (var cfg in settings.Providers.Values)
             new AntigravityProvider(
                 cfg,
                 sp.GetRequiredService<AntigravityAccountService>(),
-                sp.GetRequiredService<ILogger<AntigravityProvider>>()));
+                sp.GetRequiredService<ILogger<AntigravityProvider>>(),
+                sp.GetRequiredService<GatewayOptions>()));
     }
 }
 
@@ -181,6 +182,8 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ChatCompletionReques
                     catch (UpstreamException ex)
                     {
                         LogRequestShape("Upstream error during stream", ex, geminiReq);
+                        var errType = ex.StatusCode == System.Net.HttpStatusCode.TooManyRequests ? "insufficient_quota" : "upstream_error";
+                        var errCode = ex.StatusCode == System.Net.HttpStatusCode.TooManyRequests ? "model_quota_exhausted" : "upstream_error";
                         if (!wroteAny)
                         {
                             ctx.Response.StatusCode = (int)ex.StatusCode;
@@ -190,8 +193,8 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ChatCompletionReques
                                     Error = new OpenAiError
                                     {
                                         Message = ex.Message,
-                                        Type = "upstream_error",
-                                        Code = "upstream_error"
+                                        Type = errType,
+                                        Code = errCode
                                     }
                                 }, json));
                         }
@@ -203,8 +206,8 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ChatCompletionReques
                                     Error = new OpenAiError
                                     {
                                         Message = ex.Message,
-                                        Type = "upstream_error",
-                                        Code = "upstream_error"
+                                        Type = errType,
+                                        Code = errCode
                                     }
                                 }, json) + "\n\n");
                             await writer.WriteAsync("data: [DONE]\n\n");
@@ -256,7 +259,9 @@ app.MapPost("/v1/chat/completions", async (HttpContext ctx, ChatCompletionReques
         {
             LogRequestShape("Upstream error", ex, geminiReq);
         }
-        return ErrorJson((int)ex.StatusCode, ex.Message, "upstream_error", "upstream_error");
+        var errType = ex.StatusCode == System.Net.HttpStatusCode.TooManyRequests ? "insufficient_quota" : "upstream_error";
+        var errCode = ex.StatusCode == System.Net.HttpStatusCode.TooManyRequests ? "model_quota_exhausted" : "upstream_error";
+        return ErrorJson((int)ex.StatusCode, ex.Message, errType, errCode);
     }
     catch (Exception ex)
     {

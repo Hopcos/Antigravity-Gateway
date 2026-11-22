@@ -21,14 +21,33 @@ public sealed class AccountStatus
     public DateTimeOffset? ExpiresUtc { get; set; }
     public int? RemainingSeconds => ExpiresUtc.HasValue ? (int)Math.Max(0, (ExpiresUtc.Value - DateTimeOffset.UtcNow).TotalSeconds) : null;
     public string? Scopes { get; set; }
+    public int TotalAccounts { get; set; } = 1;
+    public int ActiveAccounts { get; set; } = 1;
+}
+
+public sealed class AccountEntry
+{
+    public string Id { get; set; } = Guid.NewGuid().ToString("N")[..8];
+    public string Email { get; set; } = "unknown";
+    public string Source { get; set; } = "unknown";
+    public string ClientId { get; set; } = AntigravityAccountService.DefaultAntigravityClientId;
+    public string ClientSecret { get; set; } = AntigravityAccountService.DefaultAntigravityClientSecret;
+    public string RefreshToken { get; set; } = "";
+    public AccessToken CurrentToken { get; set; } = AccessToken.Empty;
+    public DateTimeOffset CooldownUntil { get; set; } = DateTimeOffset.MinValue;
+    public string? InitialAccessToken { get; set; }
+    public DateTimeOffset? InitialExpiry { get; set; }
+
+    public bool IsInCooldown(DateTimeOffset now) => CooldownUntil > now;
 }
 
 /// <summary>
-/// Antigravity 账号与凭据管理服务：
-/// 1. 自动从 Windows Credential Manager（gemini:antigravity）探测当前登录的 Antigravity 账号；
-/// 2. 具备多级降级兜底：Windows Credential Manager -> ~/.gemini/oauth_creds.json -> 环境变量 -> ADC；
-/// 3. 管理双 Token 永续生命周期：基于 Google OAuth 官方 Antigravity 客户端及 Refresh Token 无限静默换取 Access Token；
-/// 4. 支持懒刷新、主动保活刷新（后台服务每分钟检查）与 401 反应式刷新重试。
+/// Antigravity 账号与多账号轮换池管理服务：
+/// 1. 自动从 Windows Credential Manager（gemini:antigravity）无感读取当前登录的 Antigravity 账号；
+/// 2. 具备多级降级与多账号探测（Windows Credential Manager + 环境变量多 Token + oauth_creds.json + ADC）；
+/// 3. 管理双 Token 永续生命周期：基于 Google OAuth 官方客户端及 Refresh Token 无限静默换取 Access Token；
+/// 4. 支持多账号池轮换：当某个账号出现 429 配额耗尽时，自动标记冷却并秒级切换至池中下一个健康账号；
+/// 5. 支持懒刷新、后台巡检保活（TokenRefresherBackgroundService）与 401 反应式刷新重试。
 /// </summary>
 public sealed class AntigravityAccountService
 {
@@ -44,8 +63,8 @@ public sealed class AntigravityAccountService
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly SemaphoreSlim _credsGate = new(1, 1);
 
-    private ResolvedCredentials? _creds;
-    private AccessToken _current = AccessToken.Empty;
+    private List<AccountEntry>? _accounts;
+    private int _activeAccountIndex;
 
     public AntigravityAccountService(AuthOptions auth, ILogger<AntigravityAccountService> log)
     {
@@ -54,46 +73,71 @@ public sealed class AntigravityAccountService
         _http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
     }
 
-    private sealed record ResolvedCredentials(
-        string ClientId,
-        string ClientSecret,
-        string RefreshToken,
-        string Email,
-        string Source,
-        string? InitialAccessToken,
-        DateTimeOffset? InitialExpiry);
-
     public AccountStatus GetStatus()
     {
+        var accounts = _accounts;
+        if (accounts is null)
+        {
+            try
+            {
+                lock (_credsGate)
+                {
+                    accounts = _accounts ??= ResolveAllAccounts();
+                }
+            }
+            catch
+            {
+                // 尚未加载成功
+            }
+        }
+
+        if (accounts is null || accounts.Count == 0)
+        {
+            return new AccountStatus
+            {
+                Email = "detecting...",
+                Source = _auth.Source,
+                HasToken = false,
+                TotalAccounts = 0,
+                ActiveAccounts = 0
+            };
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        var active = GetCurrentOrBestAccount();
+        var token = active.CurrentToken;
+        var activeCount = accounts.Count(a => !a.IsInCooldown(now));
+
         return new AccountStatus
         {
-            Email = _creds?.Email ?? "detecting...",
-            Source = _creds?.Source ?? _auth.Source,
-            HasToken = !string.IsNullOrEmpty(_current.Value),
-            ExpiresUtc = _current.ExpiresUtc == DateTimeOffset.MinValue ? null : _current.ExpiresUtc,
-            Scopes = "https://www.googleapis.com/auth/aicode https://www.googleapis.com/auth/cloud-platform"
+            Email = active.Email,
+            Source = active.Source,
+            HasToken = !string.IsNullOrEmpty(token.Value),
+            ExpiresUtc = token.ExpiresUtc == DateTimeOffset.MinValue ? null : token.ExpiresUtc,
+            Scopes = "https://www.googleapis.com/auth/aicode https://www.googleapis.com/auth/cloud-platform",
+            TotalAccounts = accounts.Count,
+            ActiveAccounts = Math.Max(1, activeCount)
         };
     }
 
-    /// <summary>获取有效的 Access Token；force=true 时强制触发刷新。</summary>
+    /// <summary>获取当前有效账号的 Access Token；force=true 时强制触发刷新。</summary>
     public async Task<AccessToken> GetTokenAsync(bool force = false, CancellationToken ct = default)
     {
+        var accounts = await EnsureAccountsLoadedAsync(ct);
         var now = DateTimeOffset.UtcNow;
-        if (!force && _current.IsValidAt(now))
-        {
-            return _current;
-        }
 
         await _gate.WaitAsync(ct);
         try
         {
-            if (!force && _current.IsValidAt(DateTimeOffset.UtcNow))
+            var account = GetCurrentOrBestAccount();
+            if (!force && account.CurrentToken.IsValidAt(now))
             {
-                return _current;
+                return account.CurrentToken;
             }
 
-            _current = await RefreshCoreAsync(ct);
-            return _current;
+            var newToken = await RefreshAccountTokenAsync(account, ct);
+            account.CurrentToken = newToken;
+            return newToken;
         }
         finally
         {
@@ -103,43 +147,114 @@ public sealed class AntigravityAccountService
 
     public Task<AccessToken> ForceRefreshAsync(CancellationToken ct = default) => GetTokenAsync(true, ct);
 
-    /// <summary>供后台保活服务定期检查：剩余有效期不足阈值时提前续期。</summary>
-    public Task RefreshIfExpiringSoonAsync(CancellationToken ct = default)
+    /// <summary>当某账号上游 429 配额耗尽时，标记其冷却并在存在多个账号时切换至下一个可用账号。</summary>
+    public void MarkAccountQuotaExhausted(TimeSpan cooldown, string reason)
     {
-        var now = DateTimeOffset.UtcNow;
-        var t = _current;
-        var threshold = TimeSpan.FromSeconds(Math.Max(t.TtlSeconds / 10, 300)); // 剩余不足 10% 或少于 5 分钟
-        if (!t.IsValidAt(now, 0) || t.ExpiresUtc - now < threshold)
+        lock (_credsGate)
         {
-            _log.LogInformation("Token approaching expiry (expires in {Secs:F0}s); initiating proactive background renewal",
-                (t.ExpiresUtc - now).TotalSeconds);
-            return GetTokenAsync(force: true, ct);
+            if (_accounts is null || _accounts.Count == 0) return;
+
+            var current = GetCurrentOrBestAccount();
+            current.CooldownUntil = DateTimeOffset.UtcNow + cooldown;
+            _log.LogWarning("Account {Email} marked on cooldown for {Secs}s due to quota exhaustion ({Reason})",
+                current.Email, cooldown.TotalSeconds, reason);
+
+            if (_accounts.Count > 1)
+            {
+                var now = DateTimeOffset.UtcNow;
+                for (var i = 1; i <= _accounts.Count; i++)
+                {
+                    var nextIdx = (_activeAccountIndex + i) % _accounts.Count;
+                    if (!_accounts[nextIdx].IsInCooldown(now))
+                    {
+                        _activeAccountIndex = nextIdx;
+                        _log.LogInformation("Rotated active Antigravity account to {Email} ({Index}/{Total})",
+                            _accounts[nextIdx].Email, nextIdx + 1, _accounts.Count);
+                        return;
+                    }
+                }
+            }
         }
-        return Task.CompletedTask;
     }
 
-    private async Task<AccessToken> RefreshCoreAsync(CancellationToken ct)
+    /// <summary>供后台保活任务调用：对账号池内所有即将过期的 Token 提前执行静默续期。</summary>
+    public async Task RefreshIfExpiringSoonAsync(CancellationToken ct = default)
     {
-        var creds = await GetCredentialsAsync(ct);
+        if (_accounts is null || _accounts.Count == 0) return;
 
-        // 如果首次加载且已有可用的初始 token，且未过期，直接使用
-        if (_current == AccessToken.Empty && !string.IsNullOrEmpty(creds.InitialAccessToken) && creds.InitialExpiry.HasValue)
+        var now = DateTimeOffset.UtcNow;
+        foreach (var account in _accounts)
         {
-            var initialExp = creds.InitialExpiry.Value;
+            var t = account.CurrentToken;
+            var threshold = TimeSpan.FromSeconds(Math.Max(t.TtlSeconds / 10, 300));
+            if (!t.IsValidAt(now, 0) || t.ExpiresUtc - now < threshold)
+            {
+                _log.LogInformation("Token for account {Email} approaching expiry; initiating proactive background renewal",
+                    account.Email);
+                try
+                {
+                    var refreshed = await RefreshAccountTokenAsync(account, ct);
+                    account.CurrentToken = refreshed;
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "Background token renewal failed for account {Email}", account.Email);
+                }
+            }
+        }
+    }
+
+    private AccountEntry GetCurrentOrBestAccount()
+    {
+        if (_accounts is null || _accounts.Count == 0)
+        {
+            throw new TokenRefreshException("没有可用的 Antigravity 账号。");
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (!_accounts[_activeAccountIndex].IsInCooldown(now))
+        {
+            return _accounts[_activeAccountIndex];
+        }
+
+        // 寻找第一个不在冷却中的账号
+        for (var i = 0; i < _accounts.Count; i++)
+        {
+            if (!_accounts[i].IsInCooldown(now))
+            {
+                _activeAccountIndex = i;
+                return _accounts[i];
+            }
+        }
+
+        // 全部在冷却，挑选最早恢复的账号
+        var earliest = _accounts.OrderBy(a => a.CooldownUntil).First();
+        _activeAccountIndex = _accounts.IndexOf(earliest);
+        return earliest;
+    }
+
+    private async Task<AccessToken> RefreshAccountTokenAsync(AccountEntry account, CancellationToken ct)
+    {
+        // 若首次加载且已有可用的初始 token 且未过期，直接使用
+        if (account.CurrentToken == AccessToken.Empty &&
+            !string.IsNullOrEmpty(account.InitialAccessToken) &&
+            account.InitialExpiry.HasValue)
+        {
+            var initialExp = account.InitialExpiry.Value;
             if (initialExp > DateTimeOffset.UtcNow.AddSeconds(60))
             {
                 var initialTtl = (int)Math.Max(60, (initialExp - DateTimeOffset.UtcNow).TotalSeconds);
-                _log.LogInformation("Using active token from {Source} for account {Email} (valid until {Exp:O})",
-                    creds.Source, creds.Email, initialExp);
-                return new AccessToken(creds.InitialAccessToken, initialExp, initialTtl);
+                _log.LogInformation("Using initial active token from {Source} for account {Email} (valid until {Exp:O})",
+                    account.Source, account.Email, initialExp);
+                return new AccessToken(account.InitialAccessToken, initialExp, initialTtl);
             }
         }
 
         using var form = new FormUrlEncodedContent(new Dictionary<string, string>
         {
-            ["client_id"] = creds.ClientId,
-            ["client_secret"] = creds.ClientSecret,
-            ["refresh_token"] = creds.RefreshToken,
+            ["client_id"] = account.ClientId,
+            ["client_secret"] = account.ClientSecret,
+            ["refresh_token"] = account.RefreshToken,
             ["grant_type"] = "refresh_token"
         });
 
@@ -149,8 +264,8 @@ public sealed class AntigravityAccountService
         if (!resp.IsSuccessStatusCode)
         {
             var hint = body.Contains("invalid_grant", StringComparison.OrdinalIgnoreCase)
-                ? "Antigravity refresh token 已失效或被撤销，请在 Antigravity 重新登录账号"
-                : "请检查 Antigravity 凭据配置";
+                ? $"Antigravity refresh token 已失效或被撤销 ({account.Email})，请在 Antigravity 重新登录账号"
+                : $"请检查账号凭据配置 ({account.Email})";
             throw new TokenRefreshException($"Token refresh failed ({(int)resp.StatusCode}): {hint}. {body}");
         }
 
@@ -159,29 +274,29 @@ public sealed class AntigravityAccountService
         var access = root.GetProperty("access_token").GetString();
         if (string.IsNullOrEmpty(access))
         {
-            throw new TokenRefreshException("OAuth token endpoint returned no access_token");
+            throw new TokenRefreshException($"OAuth token endpoint returned no access_token for {account.Email}");
         }
 
         var ttl = root.TryGetProperty("expires_in", out var exp) && exp.TryGetInt32(out var e) ? e : 3600;
         ttl = Math.Max(ttl, 60);
-        var expiresUtc = DateTimeOffset.UtcNow.AddSeconds(ttl - 60); // 预留 60s 安全保护期
+        var expiresUtc = DateTimeOffset.UtcNow.AddSeconds(ttl - 60);
 
         _log.LogInformation("Antigravity token successfully refreshed for {Email} (valid ~{Ttl}s, until {Exp:yyyy-MM-dd HH:mm:ss})",
-            creds.Email, ttl, expiresUtc.ToLocalTime());
+            account.Email, ttl, expiresUtc.ToLocalTime());
 
         return new AccessToken(access, expiresUtc, ttl);
     }
 
-    private async ValueTask<ResolvedCredentials> GetCredentialsAsync(CancellationToken ct)
+    private async ValueTask<List<AccountEntry>> EnsureAccountsLoadedAsync(CancellationToken ct)
     {
-        if (_creds is not null) return _creds;
+        if (_accounts is not null && _accounts.Count > 0) return _accounts;
 
         await _credsGate.WaitAsync(ct);
         try
         {
-            if (_creds is not null) return _creds;
-            _creds = ResolveCredentials();
-            return _creds;
+            if (_accounts is not null && _accounts.Count > 0) return _accounts;
+            _accounts = ResolveAllAccounts();
+            return _accounts;
         }
         finally
         {
@@ -189,15 +304,62 @@ public sealed class AntigravityAccountService
         }
     }
 
-    private ResolvedCredentials ResolveCredentials()
+    private List<AccountEntry> ResolveAllAccounts()
     {
-        // 1. 显式环境变量优先
-        if (!string.IsNullOrWhiteSpace(_auth.RefreshToken))
+        var list = new List<AccountEntry>();
+        var seenTokens = new HashSet<string>(StringComparer.Ordinal);
+
+        void AddIfValid(AccountEntry? entry)
+        {
+            if (entry is not null && !string.IsNullOrWhiteSpace(entry.RefreshToken) && seenTokens.Add(entry.RefreshToken))
+            {
+                list.Add(entry);
+            }
+        }
+
+        // 1. 显式环境变量列表 / 单个 Token
+        if (_auth.RefreshTokens.Count > 0)
         {
             var clientId = string.IsNullOrWhiteSpace(_auth.ClientId) ? DefaultAntigravityClientId : _auth.ClientId;
             var clientSecret = string.IsNullOrWhiteSpace(_auth.ClientSecret) ? DefaultAntigravityClientSecret : _auth.ClientSecret;
-            _log.LogInformation("Loaded Antigravity refresh credentials from environment variables");
-            return new ResolvedCredentials(clientId, clientSecret, _auth.RefreshToken, "env-configured", "Environment", null, null);
+            var idx = 1;
+            foreach (var rt in _auth.RefreshTokens)
+            {
+                if (!string.IsNullOrWhiteSpace(rt))
+                {
+                    AddIfValid(new AccountEntry
+                    {
+                        ClientId = clientId,
+                        ClientSecret = clientSecret,
+                        RefreshToken = rt.Trim(),
+                        Email = $"env-account-{idx++}",
+                        Source = "Environment (ANTIGRAVITY_REFRESH_TOKENS)"
+                    });
+                }
+            }
+            if (list.Count > 0)
+            {
+                _log.LogInformation("Loaded {Count} Antigravity account(s) from environment variable token list", list.Count);
+                return list;
+            }
+        }
+        else if (!string.IsNullOrWhiteSpace(_auth.RefreshToken))
+        {
+            var clientId = string.IsNullOrWhiteSpace(_auth.ClientId) ? DefaultAntigravityClientId : _auth.ClientId;
+            var clientSecret = string.IsNullOrWhiteSpace(_auth.ClientSecret) ? DefaultAntigravityClientSecret : _auth.ClientSecret;
+            AddIfValid(new AccountEntry
+            {
+                ClientId = clientId,
+                ClientSecret = clientSecret,
+                RefreshToken = _auth.RefreshToken.Trim(),
+                Email = "env-configured-user",
+                Source = "Environment (ANTIGRAVITY_REFRESH_TOKEN)"
+            });
+            if (list.Count > 0)
+            {
+                _log.LogInformation("Loaded Antigravity account from environment variable ANTIGRAVITY_REFRESH_TOKEN");
+                return list;
+            }
         }
 
         // 2. Windows 凭据管理器探测 (Target: gemini:antigravity)
@@ -206,13 +368,14 @@ public sealed class AntigravityAccountService
             var winCred = TryReadWindowsCredential(_auth.CredentialTarget);
             if (winCred is not null)
             {
+                AddIfValid(winCred);
                 _log.LogInformation("Discovered Antigravity account from Windows Credential Manager [{Target}]: {Email}",
                     _auth.CredentialTarget, winCred.Email);
-                return winCred;
+                return list;
             }
         }
 
-        // 3. ~/.gemini/oauth_creds.json 文件探测
+        // 3. ~/.gemini/oauth_creds.json 文件探测 (降级备选)
         var tokenFile = !string.IsNullOrEmpty(_auth.TokenFile) ? _auth.TokenFile : DefaultTokenFilePath();
         if (File.Exists(tokenFile))
         {
@@ -228,15 +391,17 @@ public sealed class AntigravityAccountService
                 if (!string.IsNullOrEmpty(rt))
                 {
                     var email = ExtractEmailFromIdToken(root.TryGetProperty("id_token", out var idt) ? idt.GetString() : null) ?? "local-gemini-user";
+                    AddIfValid(new AccountEntry
+                    {
+                        ClientId = string.IsNullOrEmpty(cid) ? DefaultAntigravityClientId : cid,
+                        ClientSecret = string.IsNullOrEmpty(sec) ? DefaultAntigravityClientSecret : sec,
+                        RefreshToken = rt,
+                        Email = email,
+                        Source = "File (~/.gemini/oauth_creds.json)",
+                        InitialAccessToken = at
+                    });
                     _log.LogInformation("Loaded Antigravity credentials from {File} for account {Email}", tokenFile, email);
-                    return new ResolvedCredentials(
-                        string.IsNullOrEmpty(cid) ? DefaultAntigravityClientId : cid,
-                        string.IsNullOrEmpty(sec) ? DefaultAntigravityClientSecret : sec,
-                        rt,
-                        email,
-                        "File (~/.gemini/oauth_creds.json)",
-                        at,
-                        null);
+                    return list;
                 }
             }
             catch (Exception ex)
@@ -245,7 +410,7 @@ public sealed class AntigravityAccountService
             }
         }
 
-        // 4. gcloud ADC 文件探测
+        // 4. gcloud ADC 文件探测 (最后降级)
         var adcFile = !string.IsNullOrEmpty(_auth.AdcFile) ? _auth.AdcFile : DefaultAdcFilePath();
         if (File.Exists(adcFile))
         {
@@ -260,8 +425,16 @@ public sealed class AntigravityAccountService
 
                 if (!string.IsNullOrEmpty(cid) && !string.IsNullOrEmpty(sec) && !string.IsNullOrEmpty(rt))
                 {
+                    AddIfValid(new AccountEntry
+                    {
+                        ClientId = cid,
+                        ClientSecret = sec,
+                        RefreshToken = rt,
+                        Email = acct ?? "adc-user",
+                        Source = "ADC File"
+                    });
                     _log.LogInformation("Loaded ADC credentials from {File} for account {Email}", adcFile, acct);
-                    return new ResolvedCredentials(cid, sec, rt, acct ?? "adc-user", "ADC File", null, null);
+                    return list;
                 }
             }
             catch (Exception ex)
@@ -270,11 +443,17 @@ public sealed class AntigravityAccountService
             }
         }
 
-        throw new TokenRefreshException(
-            "未找到有效的 Antigravity 登录凭据！请确保本机已在 Antigravity 中登录账号，或在 Windows Credential Manager 中存在 'gemini:antigravity'，或设置 ANTIGRAVITY_REFRESH_TOKEN。");
+        if (list.Count == 0)
+        {
+            throw new TokenRefreshException(
+                "未找到有效的 Antigravity 登录凭据！请确保本机已在 Antigravity 中登录账号，或在 Windows Credential Manager 中存在 'gemini:antigravity'，或设置 ANTIGRAVITY_REFRESH_TOKEN。");
+        }
+
+        _log.LogInformation("Total Antigravity accounts loaded in pool: {Count}", list.Count);
+        return list;
     }
 
-    private static ResolvedCredentials? TryReadWindowsCredential(string targetName)
+    private static AccountEntry? TryReadWindowsCredential(string targetName)
     {
         if (!OperatingSystem.IsWindows()) return null;
 
@@ -318,14 +497,16 @@ public sealed class AntigravityAccountService
                             var idToken = root.TryGetProperty("id_token", out var idt) ? idt.GetString() : null;
                             var email = ExtractEmailFromIdToken(idToken) ?? cred.UserName ?? "antigravity-user";
 
-                            return new ResolvedCredentials(
-                                DefaultAntigravityClientId,
-                                DefaultAntigravityClientSecret,
-                                refreshToken,
-                                email,
-                                "Windows Credential Manager (gemini:antigravity)",
-                                accessToken,
-                                expiry);
+                            return new AccountEntry
+                            {
+                                ClientId = DefaultAntigravityClientId,
+                                ClientSecret = DefaultAntigravityClientSecret,
+                                RefreshToken = refreshToken,
+                                Email = email,
+                                Source = "Windows Credential Manager (gemini:antigravity)",
+                                InitialAccessToken = accessToken,
+                                InitialExpiry = expiry
+                            };
                         }
                     }
                 }

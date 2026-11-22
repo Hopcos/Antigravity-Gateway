@@ -1,4 +1,5 @@
-﻿using System.Net;
+﻿using System.Collections.Concurrent;
+using System.Net;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -12,32 +13,59 @@ namespace AntigravityGateway.Services;
 /// Antigravity 原生 Provider：
 /// 直接代理 Antigravity 登录账号与 daily-cloudcode-pa / cloudcode-pa 上游，
 /// 采用 aicode-consumers 项目，支持全部 Antigravity 模型（Gemini 3.8 Flash, Gemini 2.5 Pro, Claude Sonnet, etc.）。
+/// 包含四层高可用保障：
+/// 1. 按模型独立并发控制与自适应冷却（解决全局互锁问题）；
+/// 2. 智能 HTTP Retry-After 解析与抖动指数退避；
+/// 3. 上游 429 配额耗尽 (RESOURCE_EXHAUSTED) / 503 容量过载时的自动模型故障转移 (Model Fallback)；
+/// 4. 多账号池协同轮换。
 /// </summary>
 public sealed class AntigravityProvider : IGeminiProvider
 {
+    private static readonly Dictionary<string, string[]> DefaultFallbackChains = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["claude-sonnet-4-6"] = ["gemini-3.8-flash-high", "claude-opus-4-6-thinking", "gemini-2.5-flash"],
+        ["claude-opus-4-6-thinking"] = ["claude-sonnet-4-6", "gemini-3.8-flash-high", "gemini-2.5-flash"],
+        ["gemini-3.8-flash-high"] = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"],
+        ["gemini-3.8-flash"] = ["gemini-3.8-flash-high", "gemini-3.5-flash-lite", "gemini-2.5-flash"],
+        ["gemini-3.8-flash-medium"] = ["gemini-3.8-flash", "gemini-2.5-flash"],
+        ["gemini-3.8-flash-low"] = ["gemini-3.8-flash", "gemini-2.5-flash"],
+        ["gemini-2.5-pro"] = ["gemini-3.8-flash-high", "gemini-3.8-flash", "gemini-2.5-flash"],
+        ["gemini-2.5-flash"] = ["gemini-3.5-flash-lite", "gemini-2.5-flash-lite"],
+        ["gpt-oss-120b-medium"] = ["gemini-3.8-flash-high", "gemini-2.5-flash"],
+        ["gpt-4o"] = ["gemini-3.8-flash-high", "gemini-2.5-flash"]
+    };
+
     private readonly ProviderOptions _opts;
+    private readonly GatewayOptions? _gatewayOpts;
     private readonly AntigravityAccountService _account;
     private readonly HttpClient _http;
     private readonly ILogger<AntigravityProvider> _log;
-    private readonly SemaphoreSlim _requestGate;
-    private readonly object _cooldownLock = new();
+
+    // 按模型独立的并发控制闸（避免一个模型占满全局阻塞其他可用模型）
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _modelGates = new(StringComparer.OrdinalIgnoreCase);
+
+    // 按模型独立的限流冷却
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _modelCooldowns = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, (int resetAfter, DateTimeOffset throttledAt)> _modelLastThrottles = new(StringComparer.OrdinalIgnoreCase);
+
     private readonly TimeSpan _minInterval;
-    private DateTimeOffset _nextAllowedAt = DateTimeOffset.MinValue;
-    private int _lastResetAfter;
+    private readonly bool _enableFallback;
     private List<string> _models;
 
     public AntigravityProvider(
         ProviderOptions opts,
         AntigravityAccountService account,
-        ILogger<AntigravityProvider> log)
+        ILogger<AntigravityProvider> log,
+        GatewayOptions? gatewayOpts = null)
     {
         _opts = opts;
+        _gatewayOpts = gatewayOpts;
         _account = account;
         _log = log;
         _http = new HttpClient { Timeout = TimeSpan.FromSeconds(300) };
-        var conc = Math.Max(1, opts.MaxConcurrency);
-        _requestGate = new SemaphoreSlim(conc, conc);
         _minInterval = TimeSpan.FromSeconds(Math.Max(0, opts.MinInterval));
+
+        _enableFallback = opts.EnableModelFallback ?? gatewayOpts?.EnableModelFallback ?? true;
 
         _models = opts.Models.Count > 0
             ? new List<string>(opts.Models)
@@ -56,8 +84,9 @@ public sealed class AntigravityProvider : IGeminiProvider
                 "gpt-4o"
             };
 
-        _log.LogInformation("AntigravityProvider initialized. Project={Project}, BaseUrl={Url}, Concurrency={Conc}",
-            Project, BaseUrl, conc);
+        _log.LogInformation(
+            "AntigravityProvider initialized. Project={Project}, BaseUrl={Url}, PerModelConcurrency={Conc}, ModelFallback={Fallback}",
+            Project, BaseUrl, Math.Max(1, opts.MaxConcurrency), _enableFallback);
     }
 
     public string Name => "Antigravity";
@@ -73,7 +102,10 @@ public sealed class AntigravityProvider : IGeminiProvider
         ? ua
         : "antigravity/2.24.0 (win32; x64)";
 
-    private int MaxAttempts => _opts.MaxAttempts > 0 ? _opts.MaxAttempts : 4;
+    private int MaxAttempts => _opts.MaxAttempts > 0 ? _opts.MaxAttempts : 3;
+
+    private SemaphoreSlim GateFor(string model) =>
+        _modelGates.GetOrAdd(model, _ => new SemaphoreSlim(Math.Max(1, _opts.MaxConcurrency), Math.Max(1, _opts.MaxConcurrency)));
 
     private sealed class CloudCodePayload
     {
@@ -102,8 +134,6 @@ public sealed class AntigravityProvider : IGeminiProvider
     public async Task<GeminiGenerateContentResponse> GenerateAsync(
         string model, GeminiGenerateContentRequest request, CancellationToken ct)
     {
-        // 上游 daily-cloudcode-pa 专为 stream 设计（/generateContent 为 404），
-        // 故非流式通过消费完整 stream 汇聚 candidates、parts 与 usage，确保 100% 成功率与完整性。
         var textBuilder = new System.Text.StringBuilder();
         var parts = new List<GeminiPart>();
         string? finishReason = null;
@@ -160,9 +190,129 @@ public sealed class AntigravityProvider : IGeminiProvider
         };
     }
 
-    // ---------- 流式核心 ----------
+    // ---------- 流式核心（含智能重试与自动模型故障转移） ----------
 
     public async IAsyncEnumerable<GeminiGenerateContentStreamChunk> GenerateStreamAsync(
+        string model, GeminiGenerateContentRequest request, [EnumeratorCancellation] CancellationToken ct)
+    {
+        // 尝试主模型请求
+        Exception? primaryError = null;
+        var yieldedAny = false;
+
+        IAsyncEnumerable<GeminiGenerateContentStreamChunk>? streamEnumerable = null;
+        try
+        {
+            streamEnumerable = GenerateStreamCoreAsync(model, request, ct);
+        }
+        catch (Exception ex)
+        {
+            primaryError = ex;
+        }
+
+        if (streamEnumerable is not null)
+        {
+            await using var enumerator = streamEnumerable.GetAsyncEnumerator(ct);
+            while (true)
+            {
+                bool hasNext;
+                try
+                {
+                    hasNext = await enumerator.MoveNextAsync();
+                }
+                catch (UpstreamException ex) when (!yieldedAny && IsQuotaOrCapacityExhausted(ex.StatusCode, ex.ResponseBody))
+                {
+                    primaryError = ex;
+                    break;
+                }
+                catch (Exception ex) when (!yieldedAny)
+                {
+                    primaryError = ex;
+                    break;
+                }
+
+                if (!hasNext) yield break;
+
+                yieldedAny = true;
+                yield return enumerator.Current;
+            }
+        }
+
+        // 若已输出部分内容，则不能执行切换（否则会导致客户端响应断裂）
+        if (yieldedAny || primaryError is null) yield break;
+
+        // 若未开启 Fallback 或发生非配额性错误，直接原样抛出
+        if (!_enableFallback)
+        {
+            throw primaryError;
+        }
+
+        // 开始执行智能模型降级链 (Model Fallback)
+        var fallbackList = GetFallbackCandidates(model);
+        if (fallbackList.Count == 0)
+        {
+            throw primaryError;
+        }
+
+        _log.LogWarning(
+            "Primary model '{Model}' failed ({Error}); triggering automatic failover chain: [{Chain}]",
+            model, primaryError.Message, string.Join(" -> ", fallbackList));
+
+        foreach (var fallbackModel in fallbackList)
+        {
+            if (ct.IsCancellationRequested) break;
+
+            _log.LogInformation("Attempting failover to model '{FallbackModel}'...", fallbackModel);
+            var fallbackYielded = false;
+
+            IAsyncEnumerable<GeminiGenerateContentStreamChunk>? fbStream = null;
+            try
+            {
+                fbStream = GenerateStreamCoreAsync(fallbackModel, request, ct);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning("Failover model '{FallbackModel}' preparation failed: {Error}", fallbackModel, ex.Message);
+                continue;
+            }
+
+            await using var fbEnumerator = fbStream.GetAsyncEnumerator(ct);
+            while (true)
+            {
+                bool hasNext;
+                try
+                {
+                    hasNext = await fbEnumerator.MoveNextAsync();
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning("Failover model '{FallbackModel}' execution failed: {Error}", fallbackModel, ex.Message);
+                    break;
+                }
+
+                if (!hasNext)
+                {
+                    if (fallbackYielded) yield break;
+                    break;
+                }
+
+                fallbackYielded = true;
+                yield return fbEnumerator.Current;
+            }
+
+            if (fallbackYielded)
+            {
+                _log.LogInformation("Failover model '{FallbackModel}' successfully handled the request!", fallbackModel);
+                yield break;
+            }
+        }
+
+        // 所有备选均失败，抛出包含明确指引的异常
+        throw new UpstreamException(
+            HttpStatusCode.TooManyRequests,
+            $"上游模型 '{model}' 配额耗尽 (RESOURCE_EXHAUSTED)，且备选降级链 [{string.Join(", ", fallbackList)}] 均不可用。建议：1) 检查 Google 账号使用额度；2) 切换至基础模型（如 gemini-2.5-flash / gemini-3.5-flash-lite）；3) 在 ANTIGRAVITY_REFRESH_TOKENS 中配置多账号轮换池。");
+    }
+
+    private async IAsyncEnumerable<GeminiGenerateContentStreamChunk> GenerateStreamCoreAsync(
         string model, GeminiGenerateContentRequest request, [EnumeratorCancellation] CancellationToken ct)
     {
         var upstreamModel = ResolveUpstreamModel(model);
@@ -176,8 +326,9 @@ public sealed class AntigravityProvider : IGeminiProvider
         };
 
         var json = JsonSerializer.Serialize(payload, JsonOptions.Gemini);
+        var gate = GateFor(upstreamModel);
 
-        await _requestGate.WaitAsync(ct);
+        await gate.WaitAsync(ct);
         try
         {
             for (var attempt = 1; attempt <= MaxAttempts; attempt++)
@@ -197,7 +348,7 @@ public sealed class AntigravityProvider : IGeminiProvider
 
                 try
                 {
-                    await WaitForCooldownAsync(ct);
+                    await WaitForModelCooldownAsync(upstreamModel, ct);
                     resp = await _http.SendAsync(msg, HttpCompletionOption.ResponseHeadersRead, ct);
 
                     // 401 反应式刷新与单次重试
@@ -209,20 +360,57 @@ public sealed class AntigravityProvider : IGeminiProvider
                         continue;
                     }
 
+                    // 429 速率限制 / 配额耗尽
                     if (resp.StatusCode == HttpStatusCode.TooManyRequests)
                     {
                         var errBody = await resp.Content.ReadAsStringAsync(ct);
-                        var delay = ParseRetryDelay(errBody);
-                        ApplyThrottleCooldown((int)delay.TotalSeconds);
-                        _log.LogWarning("Antigravity 429 rate limit; retry {Attempt}/{Max} after {Delay}s: {Body}",
-                            attempt, MaxAttempts, delay.TotalSeconds, Truncate(errBody, 200));
+                        var delay = ParseRetryDelay(resp, errBody, attempt);
+                        var resetSecs = (int)Math.Ceiling(delay.TotalSeconds);
+
+                        ApplyModelThrottleCooldown(upstreamModel, resetSecs);
+
+                        _log.LogWarning(
+                            "Antigravity 429 rate limit on model '{Model}'; retry {Attempt}/{Max} after {Delay:F1}s: {Body}",
+                            model, attempt, MaxAttempts, delay.TotalSeconds, Truncate(errBody, 200));
+
                         resp.Dispose();
+
+                        // 若明确为硬性配额耗尽 (RESOURCE_EXHAUSTED)，通知账号服务并快速启动 Fallback 机制
+                        if (IsQuotaOrCapacityExhausted(HttpStatusCode.TooManyRequests, errBody))
+                        {
+                            _account.MarkAccountQuotaExhausted(TimeSpan.FromMinutes(5), "429 RESOURCE_EXHAUSTED");
+                            if (_enableFallback || attempt >= MaxAttempts)
+                            {
+                                throw new UpstreamException(HttpStatusCode.TooManyRequests, errBody);
+                            }
+                        }
+
                         if (attempt < MaxAttempts)
                         {
                             await Task.Delay(delay, ct);
                             continue;
                         }
+
                         throw new UpstreamException(HttpStatusCode.TooManyRequests, errBody);
+                    }
+
+                    // 503 容量过载 / 服务暂时不可用
+                    if (resp.StatusCode == HttpStatusCode.ServiceUnavailable)
+                    {
+                        var errBody = await resp.Content.ReadAsStringAsync(ct);
+                        ApplyModelThrottleCooldown(upstreamModel, 20);
+                        _log.LogWarning(
+                            "Antigravity upstream 503 on model '{Model}'; retry {Attempt}/{Max}: {Body}",
+                            model, attempt, MaxAttempts, Truncate(errBody, 200));
+                        resp.Dispose();
+
+                        if (_enableFallback || attempt >= MaxAttempts)
+                        {
+                            throw new UpstreamException(HttpStatusCode.ServiceUnavailable, errBody);
+                        }
+
+                        await Task.Delay(TimeSpan.FromSeconds(Math.Min(attempt * 3, 10)), ct);
+                        continue;
                     }
 
                     if (!resp.IsSuccessStatusCode)
@@ -232,16 +420,17 @@ public sealed class AntigravityProvider : IGeminiProvider
                         throw new UpstreamException(resp.StatusCode, errBody);
                     }
 
-                    ApplySuccessCooldown();
+                    ApplyModelSuccessCooldown(upstreamModel);
 
                     stream = await resp.Content.ReadAsStreamAsync(ct);
                     reader = new StreamReader(stream);
                 }
                 catch (Exception ex) when (ex is not UpstreamException && attempt < MaxAttempts && IsTransient(ex))
                 {
-                    _log.LogWarning(ex, "Transient connection error during send; retry {Attempt}/{Max}", attempt, MaxAttempts);
+                    _log.LogWarning(ex, "Transient connection error during send to model '{Model}'; retry {Attempt}/{Max}",
+                        model, attempt, MaxAttempts);
                     resp?.Dispose();
-                    await Task.Delay(TimeSpan.FromSeconds(Math.Min(Math.Pow(2, attempt), 15)), ct);
+                    await Task.Delay(TimeSpan.FromSeconds(Math.Min(Math.Pow(2, attempt), 10)), ct);
                     continue;
                 }
 
@@ -272,7 +461,7 @@ public sealed class AntigravityProvider : IGeminiProvider
                             var root = doc.RootElement;
                             var unwrapped = root.TryGetProperty("response", out var r) ? r : root;
 
-                            // 捕获前置思考签名
+                            // 捕获思维链签名
                             if (unwrapped.TryGetProperty("candidates", out var cands) && cands.ValueKind == JsonValueKind.Array)
                             {
                                 foreach (var c in cands.EnumerateArray())
@@ -292,7 +481,7 @@ public sealed class AntigravityProvider : IGeminiProvider
 
                             chunk = JsonSerializer.Deserialize<GeminiGenerateContentStreamChunk>(unwrapped, JsonOptions.Gemini);
 
-                            // 如果当前 chunk 包含 functionCall 且没有 thoughtSignature，注入前置捕获的签名
+                            // 为未带签名的 functionCall 回注前置签名
                             if (chunk?.Candidates != null && !string.IsNullOrEmpty(thoughtSignatureBuffer))
                             {
                                 foreach (var c in chunk.Candidates)
@@ -320,7 +509,7 @@ public sealed class AntigravityProvider : IGeminiProvider
                             yield return chunk;
                         }
                     }
-                    yield break; // 正常读取完毕
+                    yield break;
                 }
                 finally
                 {
@@ -330,11 +519,11 @@ public sealed class AntigravityProvider : IGeminiProvider
                 }
             }
 
-            throw new UpstreamException(HttpStatusCode.BadGateway, "Antigravity upstream failed after retries.");
+            throw new UpstreamException(HttpStatusCode.BadGateway, $"Antigravity upstream failed on model '{model}' after retries.");
         }
         finally
         {
-            _requestGate.Release();
+            gate.Release();
         }
     }
 
@@ -367,7 +556,6 @@ public sealed class AntigravityProvider : IGeminiProvider
                     }
                     if (found.Count > 0)
                     {
-                        // 补充标准别名
                         if (!found.Contains("gemini-3.8-flash")) found.Insert(0, "gemini-3.8-flash");
                         if (!found.Contains("gpt-4o")) found.Add("gpt-4o");
                         _models = found;
@@ -384,44 +572,115 @@ public sealed class AntigravityProvider : IGeminiProvider
         return _models;
     }
 
+    private List<string> GetFallbackCandidates(string model)
+    {
+        var key = model.Trim().ToLowerInvariant();
+        if (_gatewayOpts?.ModelFallbackChains != null && _gatewayOpts.ModelFallbackChains.TryGetValue(key, out var customList))
+        {
+            return customList.Where(m => !string.Equals(m, key, StringComparison.OrdinalIgnoreCase)).ToList();
+        }
+
+        if (DefaultFallbackChains.TryGetValue(key, out var defaults))
+        {
+            return defaults.ToList();
+        }
+
+        // 通用降级规则
+        return new List<string> { "gemini-3.8-flash-high", "gemini-2.5-flash" }
+            .Where(m => !string.Equals(m, key, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+    }
+
     private static bool IsTransient(Exception ex) => ex is HttpRequestException or IOException or TimeoutException;
 
-    private static TimeSpan ParseRetryDelay(string body)
+    private static bool IsQuotaOrCapacityExhausted(HttpStatusCode status, string body)
     {
-        var match = System.Text.RegularExpressions.Regex.Match(body, @"reset after (\d+)\s*s", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (status == HttpStatusCode.TooManyRequests)
+        {
+            return body.Contains("RESOURCE_EXHAUSTED", StringComparison.OrdinalIgnoreCase)
+                || body.Contains("Resource has been exhausted", StringComparison.OrdinalIgnoreCase)
+                || body.Contains("quota", StringComparison.OrdinalIgnoreCase);
+        }
+        if (status == HttpStatusCode.ServiceUnavailable)
+        {
+            return body.Contains("MODEL_CAPACITY_EXHAUSTED", StringComparison.OrdinalIgnoreCase)
+                || body.Contains("capacity", StringComparison.OrdinalIgnoreCase);
+        }
+        return false;
+    }
+
+    private static TimeSpan ParseRetryDelay(HttpResponseMessage resp, string body, int attempt)
+    {
+        // 1. 检查 HTTP Header: Retry-After
+        if (resp.Headers.RetryAfter is { } ra)
+        {
+            if (ra.Delta.HasValue)
+            {
+                return TimeSpan.FromSeconds(Math.Clamp((int)ra.Delta.Value.TotalSeconds, 1, 120));
+            }
+            if (ra.Date.HasValue)
+            {
+                var delta = ra.Date.Value - DateTimeOffset.UtcNow;
+                if (delta > TimeSpan.Zero)
+                {
+                    return TimeSpan.FromSeconds(Math.Clamp((int)delta.TotalSeconds, 1, 120));
+                }
+            }
+        }
+
+        // 2. 检查 JSON 响应体中的明确指示 (reset after Ns / retryDelay)
+        var match = System.Text.RegularExpressions.Regex.Match(
+            body,
+            @"(?:reset after|retry in|retryDelay[""\s:]+)\s*(\d+)\s*s?",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
         if (match.Success && int.TryParse(match.Groups[1].Value, out var s))
         {
-            return TimeSpan.FromSeconds(Math.Clamp(s, 5, 120));
+            return TimeSpan.FromSeconds(Math.Clamp(s, 2, 120));
         }
-        return TimeSpan.FromSeconds(15);
+
+        // 3. 指数退避 + 抖动 (Jitter)，避免固定 15s 硬等
+        var baseSeconds = Math.Min(Math.Pow(2, attempt), 12);
+        var jitterMs = Random.Shared.Next(100, 800);
+        return TimeSpan.FromSeconds(baseSeconds) + TimeSpan.FromMilliseconds(jitterMs);
     }
 
-    private async ValueTask WaitForCooldownAsync(CancellationToken ct)
+    private async ValueTask WaitForModelCooldownAsync(string model, CancellationToken ct)
     {
-        DateTimeOffset until;
-        lock (_cooldownLock) { until = _nextAllowedAt; }
-        var delta = until - DateTimeOffset.UtcNow;
-        if (delta > TimeSpan.Zero) await Task.Delay(delta, ct);
-    }
-
-    private void ApplySuccessCooldown()
-    {
-        lock (_cooldownLock)
+        if (_modelCooldowns.TryGetValue(model, out var until))
         {
-            var secs = Math.Max((int)_minInterval.TotalSeconds, _lastResetAfter);
+            var delta = until - DateTimeOffset.UtcNow;
+            if (delta > TimeSpan.Zero)
+            {
+                await Task.Delay(delta, ct);
+            }
+        }
+    }
+
+    private void ApplyModelSuccessCooldown(string model)
+    {
+        var secs = (int)_minInterval.TotalSeconds;
+        if (_modelLastThrottles.TryGetValue(model, out var throttle))
+        {
+            // 冷却只在 429 发生后 2 分钟内生效，超出 2 分钟自动衰减恢复
+            if (throttle.resetAfter > 0 && DateTimeOffset.UtcNow - throttle.throttledAt < TimeSpan.FromMinutes(2))
+            {
+                secs = Math.Max(secs, throttle.resetAfter);
+            }
+        }
+
+        if (secs > 0)
+        {
             var target = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(secs);
-            if (target > _nextAllowedAt) _nextAllowedAt = target;
+            _modelCooldowns.AddOrUpdate(model, target, (_, prev) => target > prev ? target : prev);
         }
     }
 
-    private void ApplyThrottleCooldown(int resetSecs)
+    private void ApplyModelThrottleCooldown(string model, int resetSecs)
     {
-        lock (_cooldownLock)
-        {
-            _lastResetAfter = Math.Max(_lastResetAfter, resetSecs);
-            var target = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(resetSecs);
-            if (target > _nextAllowedAt) _nextAllowedAt = target;
-        }
+        var now = DateTimeOffset.UtcNow;
+        _modelLastThrottles[model] = (resetSecs, now);
+        var target = now + TimeSpan.FromSeconds(resetSecs);
+        _modelCooldowns.AddOrUpdate(model, target, (_, prev) => target > prev ? target : prev);
     }
 
     private static string Truncate(string s, int max)

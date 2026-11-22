@@ -79,9 +79,12 @@ flowchart TD
 - **获取权限**：自动获取包含 `https://www.googleapis.com/auth/aicode` 核心权限的全新 `access_token`；
 - **后台保活**：`TokenRefresherBackgroundService` 每 60 秒轮询，在有效时长不足 300 秒时提前在后台静默刷新，确保外部 Agent（Cursor、Dify、LangChain 等）的长期请求永远不会因 Token 过期而中断。
 
-### 2. ⚡ Antigravity 专属通道与后端优化
+### 2. ⚡ Antigravity 专属通道、模型自动故障转移与后端优化
 - **专用内部端点**：直连 Google 内部通道 `https://daily-cloudcode-pa.googleapis.com/v1internal`，指定 `aicode-consumers` 专属工程与 `antigravity/2.24.0` 客户端标识，避开常规 Cloud Code 订阅限制与 403 阻断。
 - **全双工流式与聚合**：由于上游限制仅开放 `:streamGenerateContent?alt=sse`，AntigravityGateway 内部实现了高吞吐 SSE 解析器。当客户端请求 `stream=false` 时，网关在内存中以纳秒级高效聚合分块并输出标准 OpenAI 响应；当客户端请求 `stream=true` 时，零延迟透传 SSE 数据。
+- **智能模型故障转移 (Automatic Model Fallback)**：当所请求的模型（如 `claude-sonnet-4-6`、`gemini-2.5-pro`）触发 Google 上游 **429 `RESOURCE_EXHAUSTED`**（配额耗尽）或 **503 `MODEL_CAPACITY_EXHAUSTED`**（模型容量过载）时，网关自动按预置降级链（如 `claude-sonnet-4-6` $\rightarrow$ `gemini-3.8-flash-high` $\rightarrow$ `gemini-2.5-flash`）无缝执行请求，开发者 IDE（Cursor / Cline 等）完全无感知、不断流！
+- **按模型独立并发与自适应退避**：并发槽位与限流冷却按模型独立隔离（`ConcurrentDictionary`），单一模型的限流绝不阻塞其他模型的极速响应；结合 `Retry-After` Header 解析与指数抖动退避。
+- **多账号轮换池 (Multi-Account Pool)**：支持配置多个 Google Refresh Token（`ANTIGRAVITY_REFRESH_TOKENS`）。当某账号配额耗尽，网关自动标记临时冷却并无缝切换至下一个健康账号，额度成倍提升。
 
 ### 3. 🧠 Gemini 3.x 深度思考与多轮工具调用 (Thought Signature) 破局
 - **思考标记 (Thought Signature) 完美适配**：Gemini 3.x（如 `gemini-3.8-flash-high`）在 Tool Calling 中引入了思维链签名校验机制，下游在回传函数结果时若缺少该签名上游将直接报 400 错误。
@@ -301,11 +304,14 @@ print(response.content)
 | :--- | :--- | :--- |
 | `GATEWAY_API_KEY` | *(空)* | 网关对外认证密钥，为空则允许任意请求访问 |
 | `GEMINI_DEFAULT_MODEL` | `gemini-3.8-flash-high` | 请求未携带模型名称时的默认路由目标 |
+| `ANTIGRAVITY_ENABLE_MODEL_FALLBACK` | `true` | 当模型 429 配额耗尽或 503 过载时是否自动优雅降级 |
 | `ANTIGRAVITY_AUTH_SOURCE` | `Auto` | 认证源策略：`Auto`（优先凭据管理器）、`File`、`Env` |
 | `ANTIGRAVITY_CREDENTIAL_TARGET`| `gemini:antigravity` | Windows 凭据管理器目标名称 |
-| `ANTIGRAVITY_REFRESH_TOKEN` | *(空)* | 手动指定 Refresh Token（用于 Linux 或 Docker 无头部署） |
+| `ANTIGRAVITY_REFRESH_TOKEN` | *(空)* | 手动指定单个 Refresh Token（用于 Linux 或 Docker 无头部署） |
+| `ANTIGRAVITY_REFRESH_TOKENS` | *(空)* | 手动指定多账号 Refresh Token（逗号分隔，激活多账号轮换池） |
 | `ANTIGRAVITY_PROJECT` | `aicode-consumers` | Google 上游专属项目 ID |
-| `ANTIGRAVITY_MAX_CONCURRENCY` | `2` | 向上游发起请求的最大并发数限制 |
+| `ANTIGRAVITY_MAX_CONCURRENCY` | `2` | 单模型向上游发起请求的最大并发数限制 |
+| `ANTIGRAVITY_MAX_ATTEMPTS` | `3` | 请求异常时的最大重试次数 |
 
 ### 跨平台与 Docker 部署
 在没有安装 Antigravity 的 Linux 服务器或 Docker 容器中，可通过传入提取的 Refresh Token 启动：
@@ -332,13 +338,20 @@ dotnet run --project src/AntigravityGateway/AntigravityGateway.csproj --urls "ht
 ### Q2: 报错 `Antigravity credential not found`？
 说明当前 Windows 电脑未登录 Antigravity。请在 Antigravity 插件中登录任意 Google 账号，登录成功后系统会自动在凭据管理器生成 `gemini:antigravity`，网关即可无感读取。
 
-### Q3: 为什么请求某些模型出现 503 `MODEL_CAPACITY_EXHAUSTED`？
-这是 Google 云端对该模型的并发配额保护（尤其是 `gemini-2.5-pro` 在工作日高峰）。将客户端模型切换为 **`gemini-3.8-flash-high`** 或 **`claude-sonnet-4-6`** 即可恢复极速响应。
+### Q3: 为什么请求出现 429 `RESOURCE_EXHAUSTED` (Resource has been exhausted)？
+这是由于所请求的模型（如 `claude-sonnet-4-6`、`gemini-2.5-pro`）在 Google 上游达到了单模型额度上限或滚动窗口限制。
+- **网关自动解法**：网关已默认开启 **自动模型故障转移 (Model Fallback)**，遇到 429/503 时会自动秒级切换到高配额备选模型（如 `gemini-3.8-flash-high`），您的 IDE（Cursor / Cline 等）完全无感知。
+- **多账号轮换**：若需要更大的 Claude 或 Pro 额度，可通过环境变量 `ANTIGRAVITY_REFRESH_TOKENS="token1,token2"` 配置多个账号，网关会自动在账号耗尽时轮换。
+- **手动切换**：在客户端中将模型切换为配额极其充足的 **`gemini-3.8-flash-high`** 或 **`gemini-2.5-flash`**。
 
-### Q4: 如何确认双 Token 已经成功自动永续？
+### Q4: 为什么请求某些模型出现 503 `MODEL_CAPACITY_EXHAUSTED`？
+这是 Google 云端对该模型的并发配额保护（尤其是 `gemini-2.5-pro` 在工作日高峰）。网关会自动降级至 `gemini-3.8-flash-high`，保障您的开发永不断流。
+
+### Q5: 如何确认双 Token 已经成功自动永续？
 访问 `http://127.0.0.1:5055/v1/health`：
 - 若返回 `status: healthy`；
 - `remainingSeconds` 会在接近 300 秒时自动重置回约 3540 秒；
+- `totalAccounts` 展示当前账号池中已载入的账号总数；
 - 证明后台定时轮询保活服务与 OAuth 2.0 刷新工作完全正常。
 
 ---

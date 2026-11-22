@@ -9,6 +9,12 @@ public sealed class GatewayOptions
     /// <summary>请求未指定 model 时使用的默认模型。</summary>
     public string DefaultModel { get; set; } = "gemini-3.8-flash-high";
 
+    /// <summary>当上游模型配额耗尽 (429 RESOURCE_EXHAUSTED) 或过载 (503) 时，是否自动降级至备选模型（默认 true）。</summary>
+    public bool EnableModelFallback { get; set; } = true;
+
+    /// <summary>自定义模型降级映射链。如 "claude-sonnet-4-6": ["gemini-3.8-flash-high", "gemini-2.5-flash"]</summary>
+    public Dictionary<string, List<string>>? ModelFallbackChains { get; set; }
+
     public AuthOptions Auth { get; set; } = new();
 
     /// <summary>命名 Provider 集合。键 = Provider 名（如 "Antigravity", "CodeAssist", "Vertex"）。</summary>
@@ -33,6 +39,9 @@ public sealed class AuthOptions
     public string? ClientId { get; set; }
     public string? ClientSecret { get; set; }
     public string? RefreshToken { get; set; }
+
+    /// <summary>多账号 Refresh Token 列表（支持逗号分隔或集合配置，用于多账号轮换与池化）。</summary>
+    public List<string> RefreshTokens { get; set; } = new();
 }
 
 public sealed class ProviderOptions
@@ -67,6 +76,9 @@ public sealed class ProviderOptions
     /// <summary>相邻两次后端请求的最小间隔（秒，默认 0 = 不强制）。</summary>
     public int MinInterval { get; set; } = 0;
 
-    /// <summary>429 时的最大重试次数（默认 4）。</summary>
-    public int MaxAttempts { get; set; } = 4;
+    /// <summary>429 时的最大重试次数（默认 3）。</summary>
+    public int MaxAttempts { get; set; } = 3;
+
+    /// <summary>是否开启当前 Provider 的模型故障转移降级（null 则继承网关配置）。</summary>
+    public bool? EnableModelFallback { get; set; }
 }
