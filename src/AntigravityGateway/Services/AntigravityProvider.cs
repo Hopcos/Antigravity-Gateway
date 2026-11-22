@@ -378,20 +378,17 @@ public sealed class AntigravityProvider : IGeminiProvider
 
                         resp.Dispose();
 
-                        // 通知账号服务（多账号轮换场景下生效，单账号自动跳过）
-                        if (IsQuotaOrCapacityExhausted(HttpStatusCode.TooManyRequests, errBody))
-                        {
-                            _account.MarkAccountQuotaExhausted(TimeSpan.FromMinutes(2), "429 RESOURCE_EXHAUSTED");
-                            if (_enableFallback || attempt >= MaxAttempts)
-                            {
-                                throw new UpstreamException(HttpStatusCode.TooManyRequests, errBody);
-                            }
-                        }
-
+                        // 若仍在重试次数内，按上游指示（Retry-After / reset after Ns）退避重试该模型
                         if (attempt < MaxAttempts)
                         {
                             await Task.Delay(delay, ct);
                             continue;
+                        }
+
+                        // 耗尽所有重试次数后，通知账号服务（多账号轮换生效），并抛出异常触发 Fallback 降级链
+                        if (IsQuotaOrCapacityExhausted(HttpStatusCode.TooManyRequests, errBody))
+                        {
+                            _account.MarkAccountQuotaExhausted(TimeSpan.FromMinutes(2), "429 RESOURCE_EXHAUSTED");
                         }
 
                         throw new UpstreamException(HttpStatusCode.TooManyRequests, errBody);
@@ -407,13 +404,13 @@ public sealed class AntigravityProvider : IGeminiProvider
                             model, attempt, MaxAttempts, Truncate(errBody, 200));
                         resp.Dispose();
 
-                        if (_enableFallback || attempt >= MaxAttempts)
+                        if (attempt < MaxAttempts)
                         {
-                            throw new UpstreamException(HttpStatusCode.ServiceUnavailable, errBody);
+                            await Task.Delay(TimeSpan.FromSeconds(Math.Min(attempt * 2, 8)), ct);
+                            continue;
                         }
 
-                        await Task.Delay(TimeSpan.FromSeconds(Math.Min(attempt * 3, 10)), ct);
-                        continue;
+                        throw new UpstreamException(HttpStatusCode.ServiceUnavailable, errBody);
                     }
 
                     if (!resp.IsSuccessStatusCode)
