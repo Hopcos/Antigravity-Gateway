@@ -7,7 +7,7 @@ namespace AntigravityGateway.Tests.UnitTests;
 public class GeminiRequestBuilderTests
 {
     [Fact]
-    public void Build_TranslatesSystemAndUserMessages()
+    public void Build_TranslatesSystemAndUserMessages_InlinesIntoUserTurnByDefault()
     {
         var req = new ChatCompletionRequest
         {
@@ -20,6 +20,30 @@ public class GeminiRequestBuilderTests
         };
 
         var gemini = GeminiRequestBuilder.Build(req);
+
+        // 默认模式下 system 指令内联至首回合 user 前缀，避免 Google CloudCode PA 针对外部 Agent 系统的 systemInstruction 触发 429 配额拦截
+        Assert.Null(gemini.SystemInstruction);
+        Assert.Single(gemini.Contents);
+        Assert.Equal("user", gemini.Contents[0].Role);
+        Assert.Single(gemini.Contents[0].Parts);
+        Assert.Contains("You are a test assistant.", gemini.Contents[0].Parts[0].Text);
+        Assert.Contains("Hello!", gemini.Contents[0].Parts[0].Text);
+    }
+
+    [Fact]
+    public void Build_TranslatesSystemAndUserMessages_ExplicitSystemInstructionMode()
+    {
+        var req = new ChatCompletionRequest
+        {
+            Model = "gemini-3.8-flash-high",
+            Messages = new List<ChatMessage>
+            {
+                new() { Role = "system", Content = "You are a test assistant." },
+                new() { Role = "user", Content = "Hello!" }
+            }
+        };
+
+        var gemini = GeminiRequestBuilder.Build(req, inlineSystemInstruction: false);
 
         Assert.NotNull(gemini.SystemInstruction);
         Assert.Single(gemini.SystemInstruction.Parts);

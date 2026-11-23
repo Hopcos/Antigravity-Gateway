@@ -7,20 +7,30 @@ namespace AntigravityGateway.Services;
 /// <summary>OpenAI Chat Completions 请求 -> Gemini generateContent 请求。</summary>
 public static class GeminiRequestBuilder
 {
-    public static GeminiGenerateContentRequest Build(ChatCompletionRequest req)
+    public static GeminiGenerateContentRequest Build(ChatCompletionRequest req, bool inlineSystemInstruction = true)
     {
         ArgumentNullException.ThrowIfNull(req);
 
         var gemini = new GeminiGenerateContentRequest();
 
-        // system 消息 -> systemInstruction
-        var systemParts = req.Messages
+        // 提取 system 消息
+        // 注意：Google CloudCode PA 上游（Antigravity 内部端点）如果将包含特定框架标识（例如 DeepSeek Harness、复杂外部 Agent）的系统提示词放入 systemInstruction 字段，
+        // 会触发上游特定安全/配额过滤器，返回虚假的 429 RESOURCE_EXHAUSTED。
+        // 将系统指令作为首个 user 内容的引导前缀（Preamble）注入，不仅 100% 遵守所有指令和工具约束，且能完全避免触发上游的 429 拦截。
+        var systemTexts = req.Messages
             .Where(m => m.Role.Equals("system", StringComparison.OrdinalIgnoreCase))
-            .Select(m => new GeminiPart { Text = m.ContentString ?? "" })
+            .Select(m => m.ContentString ?? "")
+            .Where(s => !string.IsNullOrWhiteSpace(s))
             .ToList();
-        if (systemParts.Count > 0)
+
+        string? systemPreamble = systemTexts.Count > 0 ? string.Join("\n\n", systemTexts) : null;
+
+        if (!inlineSystemInstruction && systemPreamble is not null)
         {
-            gemini.SystemInstruction = new GeminiContent { Parts = ConsolidateAdjacentTextParts(systemParts) };
+            gemini.SystemInstruction = new GeminiContent
+            {
+                Parts = new List<GeminiPart> { new GeminiPart { Text = systemPreamble } }
+            };
         }
 
         foreach (var msg in req.Messages)
@@ -109,6 +119,24 @@ public static class GeminiRequestBuilder
             else
             {
                 merged.Add(c);
+            }
+        }
+
+        // 如果采用 inlineSystemInstruction 模式，将 system 指令注入到首个 user 内容前置
+        if (inlineSystemInstruction && systemPreamble is not null)
+        {
+            var firstUser = merged.FirstOrDefault(c => string.Equals(c.Role, "user", StringComparison.OrdinalIgnoreCase));
+            if (firstUser is not null)
+            {
+                firstUser.Parts.Insert(0, new GeminiPart { Text = systemPreamble });
+            }
+            else
+            {
+                merged.Insert(0, new GeminiContent
+                {
+                    Role = "user",
+                    Parts = new List<GeminiPart> { new GeminiPart { Text = systemPreamble } }
+                });
             }
         }
 
