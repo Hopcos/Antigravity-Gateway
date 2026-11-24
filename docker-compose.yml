@@ -9,16 +9,11 @@ services:
     restart: unless-stopped
     ports:
       - "5055:5055"
+    env_file:
+      - .env
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
-      - GATEWAY_API_KEY=sk-antigravity
-      - GEMINI_DEFAULT_MODEL=gemini-3.8-flash-high
-      - ANTIGRAVITY_AUTH_SOURCE=Env
-      - ANTIGRAVITY_PROJECT=aicode-consumers
-      # 当在非宿主机 Docker 容器中运行时，可通过环境变量传入 refresh token:
-      # - ANTIGRAVITY_REFRESH_TOKEN=your_refresh_token_here
-      # - ANTIGRAVITY_CLIENT_ID=1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com
-      # - ANTIGRAVITY_CLIENT_SECRET=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
-    volumes:
-      # 可选：挂载主机上的凭据文件
-      - ~/.gemini:/root/.gemini:ro
+      # 其余配置（如 GATEWAY_API_KEY、ANTIGRAVITY_REFRESH_TOKEN 等）统一由根目录 .env 文件管理
+    # volumes:
+      # 可选：若改用文件凭据而非 .env 中的 ANTIGRAVITY_REFRESH_TOKEN，可取消注释挂载
+      # - ~/.gemini:/root/.gemini:ro
