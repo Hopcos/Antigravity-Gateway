@@ -4,11 +4,10 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
-COPY src/AntigravityGateway/*.csproj src/AntigravityGateway/
-RUN dotnet restore src/AntigravityGateway/AntigravityGateway.csproj
+COPY src/AntigravityGateway/*.csproj ./
+RUN dotnet restore AntigravityGateway.csproj
 
-COPY src/AntigravityGateway/ src/AntigravityGateway/
-WORKDIR /src/AntigravityGateway
+COPY src/AntigravityGateway/ ./
 RUN dotnet publish AntigravityGateway.csproj -c Release -o /app/publish /p:UseAppHost=false
 
 # ==============================================================
